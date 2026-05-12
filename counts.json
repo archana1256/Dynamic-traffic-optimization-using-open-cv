@@ -1,0 +1,10 @@
+{
+  "source": "traffic.mp4",
+  "timestamp": "16:01:33",
+  "roads": {
+    "North": 5,
+    "South": 3,
+    "East": 7,
+    "West": 2
+  }
+}
