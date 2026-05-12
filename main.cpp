@@ -1,0 +1,665 @@
+/*
+ * DYNAMIC TRAFFIC SIGNAL OPTIMIZATION SYSTEM
+ * Build : g++ main.cpp -o main
+ * Run   : .\main.exe
+ */
+
+#include <algorithm>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
+#include <queue>
+#include <random>
+#include <string>
+#include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+void sleepMs(int ms) { Sleep(ms); }
+void enableColors() {
+  HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+  DWORD mode = 0;
+  GetConsoleMode(h, &mode);
+  SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+}
+#else
+#include <unistd.h>
+void sleepMs(int ms) { usleep(ms * 1000); }
+void enableColors() {}
+#endif
+
+int clamp(int v, int lo, int hi) {
+  if (v < lo)
+    return lo;
+  if (v > hi)
+    return hi;
+  return v;
+}
+
+const std::string RST = "\033[0m";
+const std::string BOLD = "\033[1m";
+const std::string GRN = "\033[32m";
+const std::string YLW = "\033[33m";
+const std::string BLU = "\033[34m";
+const std::string MAG = "\033[35m";
+const std::string CYN = "\033[36m";
+const std::string BGGRN = "\033[42m";
+const std::string BGRED = "\033[41m";
+const std::string BGYLW = "\033[43m";
+const std::string CLRSCR = "\033[2J\033[H";
+
+const int NUM_ROADS = 4;
+const int T_CYCLE = 60;
+const int MIN_GREEN = 5;
+const int MAX_GREEN = 45;
+const int YELLOW_SEC = 2;
+const int THROUGHPUT =
+    2; // vehicles cleared per second of green (comparison model)
+
+enum class Sig { R, Y, G };
+
+struct Road {
+  std::string name;
+  int vehicles = 0;
+  int originalInput = 0;
+  Sig signal = Sig::R;
+  int totalCleared = 0;
+  bool hasEmergency = false; // Emergency vehicle preemption flag
+  int lastSeenOpenCv = 0;
+};
+
+struct SchedEntry {
+  int roadIdx, vehicles, greenTime, rank;
+  bool hasEmergency = false;
+  // Max-heap comparator:
+  // Emergency vehicles ALWAYS jump to front regardless of vehicle count.
+  // If neither or both have emergency, fall back to vehicle count (greedy).
+  bool operator<(const SchedEntry &o) const {
+    if (this->hasEmergency != o.hasEmergency)
+      return !this->hasEmergency; // emergency road has HIGHER priority
+    return vehicles < o.vehicles; // greedy fallback
+  }
+};
+
+// ── Phase 3: Read vehicle counts produced by detector.py (OpenCV MOG2) ───────
+// detector.py writes counts.json every second with real vehicle counts.
+// This function reads that file and returns counts for all 4 roads.
+// If the file is missing or unreadable, it falls back to the last known values.
+
+struct DetectorCounts {
+  int north = 0, south = 0, east = 0, west = 0;
+  bool valid = false;
+};
+
+DetectorCounts readCountsJson() {
+  DetectorCounts dc;
+  std::ifstream f("counts.json");
+  if (!f.is_open()) return dc;
+
+  // Minimal JSON parse — look for "North", "South", "East", "West" values
+  // without pulling in a full JSON library.
+  std::string content((std::istreambuf_iterator<char>(f)),
+                       std::istreambuf_iterator<char>());
+  f.close();
+
+  auto extractInt = [&](const std::string &key) -> int {
+    // Looks for  "Key": <number>  anywhere in the string
+    std::string search = "\"" + key + "\": ";
+    size_t pos = content.find(search);
+    if (pos == std::string::npos) {
+      search = "\"" + key + "\":";
+      pos = content.find(search);
+    }
+    if (pos == std::string::npos) return -1;
+    pos += search.size();
+    // skip whitespace
+    while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\t')) ++pos;
+    int val = 0;
+    bool found = false;
+    while (pos < content.size() && std::isdigit((unsigned char)content[pos])) {
+      val = val * 10 + (content[pos] - '0');
+      ++pos; found = true;
+    }
+    return found ? val : -1;
+  };
+
+  int n = extractInt("North");
+  int s = extractInt("South");
+  int e = extractInt("East");
+  int w = extractInt("West");
+
+  if (n < 0 || s < 0 || e < 0 || w < 0) return dc; // parse failed
+  dc.north = n; dc.south = s; dc.east = e; dc.west = w;
+  dc.valid = true;
+  return dc;
+}
+
+// SimDetector removed — counts are refreshed directly from counts.json in rebuild().
+
+// ── Greedy Scheduler — DAA Core ──────────────────────────────────────────────
+// Strategy : Greedy — always serve the road with the most vehicles first
+// Structure: Max-Heap (std::priority_queue) for O(log n) greedy selection
+// Formula  : T_i = (V_i / V_total) * T_CYCLE   clamped to [MIN_GREEN,
+// MAX_GREEN] Complexity: O(n log n) — n heap insertions + n extract-max
+// operations
+class GreedyScheduler {
+public:
+  static std::vector<SchedEntry> build(const std::vector<Road> &roads) {
+    int total = 0;
+    for (int i = 0; i < (int)roads.size(); i++)
+      total += roads[i].vehicles;
+    if (total == 0)
+      total = 1;
+
+    // Priority Queue (Max-Heap)
+    //  Push all roads into a max-heap keyed by vehicle count.
+    //  The greedy choice — "pick the busiest road" — is an O(log n)
+    //  extract-max from the heap, vs O(n) scan of an unsorted list.
+    std::priority_queue<SchedEntry> pq;
+    for (int i = 0; i < (int)roads.size(); i++) {
+      int vi = roads[i].vehicles;
+      int t = (int)((float)vi / total * T_CYCLE + 0.5f);
+      t = clamp(t, MIN_GREEN, MAX_GREEN);
+      // Emergency vehicles always get MAX_GREEN green time
+      if (roads[i].hasEmergency)
+        t = MAX_GREEN;
+      SchedEntry e;
+      e.roadIdx = i;
+      e.vehicles = vi;
+      e.greenTime = t;
+      e.hasEmergency = roads[i].hasEmergency;
+      e.rank = 0; // rank assigned during extraction
+      pq.push(e); // O(log n) heap insert
+    }
+
+    // ── Greedy extraction — highest-priority road comes out first ─────
+    std::vector<SchedEntry> sched;
+    int rank = 0;
+    while (!pq.empty()) {
+      SchedEntry top = pq.top(); // O(1)  peek max
+      pq.pop();                  // O(log n) extract max
+      top.rank = rank++;
+      sched.push_back(top);
+    }
+    return sched;
+  }
+
+  // Green-time utilisation: % of total green seconds given to roads with
+  // vehicles
+  static int efficiency(const std::vector<Road> &roads,
+                        const std::vector<SchedEntry> &sched) {
+    if (sched.empty())
+      return 0;
+    int usefulTime = 0, totalTime = 0;
+    for (int i = 0; i < (int)sched.size(); i++) {
+      totalTime += sched[i].greenTime;
+      if (roads[sched[i].roadIdx].vehicles > 0)
+        usefulTime += sched[i].greenTime;
+    }
+    return totalTime > 0 ? usefulTime * 100 / totalTime : 100;
+  }
+};
+
+// ── Display helpers
+// ───────────────────────────────────────────────────────────
+std::string badge(Sig s) {
+  if (s == Sig::G)
+    return BGGRN + BOLD + " G " + RST;
+  if (s == Sig::Y)
+    return BGYLW + BOLD + " Y " + RST;
+  return BGRED + BOLD + " R " + RST;
+}
+
+std::string bar(int v, int mx, int w, std::string col) {
+  int f = mx > 0 ? v * w / mx : 0;
+  std::string b = col + "[";
+  for (int i = 0; i < w; i++)
+    b += (i < f ? "#" : ".");
+  return b + "]" + RST;
+}
+
+std::string tbar(int cur, int tot) {
+  int w = 14, f = tot > 0 ? cur * w / tot : 0;
+  std::string b = GRN + "[";
+  for (int i = 0; i < w; i++)
+    b += (i < f ? "=" : ".");
+  return b + "] " + std::to_string(cur) + "s" + RST;
+}
+
+void printHeader() {
+  std::cout << BOLD + CYN
+            << "+----------------------------------------------------------+\n"
+               "|   DYNAMIC TRAFFIC SIGNAL OPTIMIZATION SYSTEM            |\n"
+               "|   DAA: Greedy Scheduling  |  OpenCV: MOG2  |  C++      |\n"
+               "+----------------------------------------------------------+\n"
+            << RST;
+}
+
+void printView(const std::vector<Road> &roads,
+               const std::vector<SchedEntry> &sched, int pi, int timer,
+               int cycle, int cleared) {
+  std::cout << "\n"
+            << "                " << BOLD << roads[0].name << RST << "  "
+            << badge(roads[0].signal) << "  " << roads[0].vehicles << "v\n"
+            << "                    |\n"
+            << " " << BOLD << roads[3].name << RST << " "
+            << badge(roads[3].signal) << " " << roads[3].vehicles << "v"
+            << "  ----[+]----  " << roads[2].name << " "
+            << badge(roads[2].signal) << " " << roads[2].vehicles << "v\n"
+            << "                    |\n"
+            << "                " << BOLD << roads[1].name << RST << "  "
+            << badge(roads[1].signal) << "  " << roads[1].vehicles << "v\n\n";
+
+  std::cout << BOLD << "  Cycle: " << YLW << cycle << RST << BOLD
+            << "   Cleared: " << GRN << cleared << RST << BOLD
+            << "   Efficiency: " << CYN
+            << GreedyScheduler::efficiency(roads, sched) << "%" << RST
+            << "  (green secs on active roads)\n\n";
+
+  std::cout << BOLD << "  GREEDY SIGNAL QUEUE:\n"
+            << RST
+            << "  +----+----------+----------+----------+------------------+\n"
+            << "  | #  | Road     | Vehicles | Green(s) | Load             |\n"
+            << "  +----+----------+----------+----------+------------------+\n";
+
+  for (int r = 0; r < (int)sched.size(); r++) {
+    const SchedEntry &s = sched[r];
+    bool act = (r == pi % (int)sched.size());
+    std::string p = act ? BGGRN + BOLD : "";
+    std::string e = act ? RST : "";
+    std::string t = act ? (GRN + std::to_string(timer) + "s" + RST)
+                        : (std::to_string(s.greenTime) + "s");
+    std::cout << "  | " << p << std::setw(2) << (r + 1) << e << " | " << p
+              << std::left << std::setw(8) << roads[s.roadIdx].name << e
+              << " |    " << p << std::right << std::setw(3) << s.vehicles
+              << "     " << e << "| " << std::setw(4) << t << "    "
+              << "| " << bar(s.vehicles, 80, 14, act ? GRN : BLU) << "   |\n";
+  }
+  std::cout
+      << "  +----+----------+----------+----------+------------------+\n\n";
+
+  if (!sched.empty()) {
+    const SchedEntry &cur = sched[pi % sched.size()];
+    std::string ph = (roads[cur.roadIdx].signal == Sig::Y)
+                         ? YLW + "YELLOW" + RST
+                         : GRN + "GREEN" + RST;
+    std::cout << "  Active: " << BOLD << roads[cur.roadIdx].name << RST
+              << "  | " << ph << "  " << tbar(timer, cur.greenTime) << "\n";
+  }
+
+  std::cout << "\n  " << CYN << "[OpenCV MOG2 simulated] " << RST << "Counts: ";
+  for (int i = 0; i < (int)roads.size(); i++)
+    std::cout << roads[i].name << ":" << roads[i].vehicles << " ";
+  std::cout << "\n";
+}
+
+void printSched(const std::vector<Road> &roads,
+                const std::vector<SchedEntry> &sched, int cycle) {
+  int total = 0;
+  for (int i = 0; i < (int)roads.size(); i++)
+    total += roads[i].vehicles;
+
+  std::cout << "\n"
+            << BOLD + MAG << "  === GREEDY SCHEDULE (Cycle " << cycle
+            << ") ===\n"
+            << RST << MAG << "  T_i = (V_i / " << total << ") x " << T_CYCLE
+            << "s  clamp[" << MIN_GREEN << "," << MAX_GREEN << "]\n"
+            << RST;
+
+  for (int i = 0; i < (int)sched.size(); i++) {
+    const SchedEntry &s = sched[i];
+    float pct = total > 0 ? (float)s.vehicles / total * 100.0f : 0.0f;
+    std::cout << "  #" << (s.rank + 1) << " " << BOLD << std::left
+              << std::setw(8) << roads[s.roadIdx].name << RST << " | "
+              << std::right << std::setw(2) << s.vehicles << "v (" << std::fixed
+              << std::setprecision(1) << pct << "%)"
+              << " | " << GRN << std::setw(2) << s.greenTime << "s" << RST
+              << " " << bar(s.greenTime, MAX_GREEN, 12, YLW) << "\n";
+  }
+  std::cout << "\n";
+  sleepMs(1500);
+}
+
+// ── Traffic System
+// ────────────────────────────────────────────────────────────
+class TrafficSystem {
+  std::vector<Road> roads;
+  std::vector<SchedEntry> schedule;
+  int pi = 0, timer = 0, cycle = 1, cleared = 0;
+  bool yPhase = false, done = false;
+  int yTimer = 0;
+  // Simulation now runs continuously reflecting OpenCV video
+
+  void allRed() {
+    for (int i = 0; i < (int)roads.size(); i++)
+      roads[i].signal = Sig::R;
+  }
+
+  void syncWithOpenCV() {
+    DetectorCounts dc = readCountsJson();
+    if (dc.valid) {
+      int fresh[4] = { dc.north, dc.south, dc.east, dc.west };
+      for (int i = 0; i < (int)roads.size() && i < 4; i++) {
+        roads[i].vehicles = clamp(fresh[i], 0, 80);
+      }
+    }
+  }
+
+  void rebuild() {
+    syncWithOpenCV(); // Sync new arrivals at the start of cycle
+
+    int totalV = 0;
+    for (const auto &r : roads)
+      totalV += r.vehicles;
+
+    // Simulation runs indefinitely; removed totalV == 0 check
+    // ── Random Emergency Vehicle Simulation (12% chance per road per cycle)
+    static std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> chance(1, 100);
+    for (int i = 0; i < (int)roads.size(); i++) {
+      roads[i].hasEmergency = false; // Reset from previous cycle
+      if (chance(rng) <= 5) {
+        roads[i].hasEmergency = true;
+        std::cout << "\n  " << BGRED << BOLD << " !! EMERGENCY !! " << RST
+                  << " Ambulance detected on " << BOLD << roads[i].name << RST
+                  << " — preempting to front of queue!\n";
+        sleepMs(800);
+      }
+    }
+    schedule = GreedyScheduler::build(roads);
+    if (!schedule.empty()) {
+      timer = schedule[0].greenTime;
+      allRed();
+      roads[schedule[0].roadIdx].signal = Sig::G;
+      // Alert if the first road in schedule has an emergency
+      if (schedule[0].hasEmergency)
+        std::cout << "  " << BGGRN << BOLD << " EMERGENCY GREEN " << RST
+                  << " Clearing " << roads[schedule[0].roadIdx].name << "\n";
+    }
+    printSched(roads, schedule, cycle);
+  }
+
+  void discharge(int idx) {
+    // FIX 2: Use float before casting to int to avoid truncation losing the
+    // last car
+    float frac = roads[idx].vehicles * 0.70f;
+    int n = (int)(frac + 0.5f); // round instead of truncate
+    if (n < 1 && roads[idx].vehicles > 0)
+      n = 1; // always clear at least 1 car
+    if (n > roads[idx].vehicles)
+      n = roads[idx].vehicles;
+    // C++ no longer subtracts vehicles; we let OpenCV video naturally control the queue
+    roads[idx].totalCleared += n;
+    cleared += n;
+
+    std::cout << "\n  " << GRN << ">> " << roads[idx].name
+              << " phase done: " << n << " vehicles cleared, "
+              << roads[idx].vehicles << " remaining" << RST << "\n";
+    sleepMs(800);
+  }
+
+public:
+  TrafficSystem() {
+    printHeader();
+    std::string names[4] = {"North", "South", "East", "West"};
+
+    // ── Phase 3: Read initial vehicle counts from counts.json (written by detector.py)
+    std::cout << "\n" << CYN << "  [Phase 3] Reading vehicle counts from detector.py...\n" << RST;
+
+    DetectorCounts dc = readCountsJson();
+
+    if (!dc.valid) {
+      // Wait up to 30s for detector.py to produce counts.json
+      int waitSecs = 0;
+      const int MAX_WAIT = 30;
+      while (!dc.valid && waitSecs < MAX_WAIT) {
+        std::cout << "  Waiting for detector.py to write counts.json... ("
+                  << waitSecs << "s)\r" << std::flush;
+        sleepMs(1000);
+        ++waitSecs;
+        dc = readCountsJson();
+      }
+    }
+
+    if (!dc.valid) {
+      std::cout << "\n" << YLW
+                << "  WARNING: counts.json not found. "
+                << "Falling back to demo values (N=20 S=15 E=30 W=10).\n"
+                << RST;
+      dc.north = 20; dc.south = 15; dc.east = 30; dc.west = 10;
+    } else {
+      std::cout << GRN << "  [Phase 3] counts.json loaded successfully!\n" << RST;
+    }
+
+    int initCounts[4] = { dc.north, dc.south, dc.east, dc.west };
+
+    for (int i = 0; i < 4; i++) {
+      Road r;
+      r.name = names[i];
+      r.vehicles = clamp(initCounts[i], 0, 80);
+      r.originalInput = r.vehicles;
+      r.lastSeenOpenCv = initCounts[i];
+      roads.push_back(r);
+    }
+
+    std::cout << "\n  Initial vehicle counts from OpenCV detector:\n";
+    for (int i = 0; i < 4; i++)
+      std::cout << "    " << names[i] << " : " << roads[i].vehicles << "v\n";
+
+    // FIX 1: Warn if all roads have zero vehicles
+    int totalInput = 0;
+    for (int i = 0; i < 4; i++) totalInput += roads[i].vehicles;
+    if (totalInput == 0) {
+      std::cout << YLW << "  WARNING: All roads have 0 vehicles. "
+                << "Simulation will run with minimum green times only.\n" << RST;
+    }
+
+    std::cout << "\n" << GRN
+              << "  Starting simulation (running until all traffic is cleared)...\n"
+              << RST;
+    sleepMs(1000);
+    rebuild();
+  }
+
+  void tick() {
+    if (done)
+      return;
+
+    if (yPhase) {
+      --yTimer;
+      allRed();
+      roads[schedule[pi % schedule.size()].roadIdx].signal = Sig::Y;
+      timer = yTimer;
+      if (yTimer <= 0) {
+        yPhase = false;
+        pi = (pi + 1) % (int)schedule.size();
+        if (pi == 0) {
+          ++cycle;
+          rebuild();
+          return;
+        }
+        allRed();
+        roads[schedule[pi].roadIdx].signal = Sig::G;
+        timer = schedule[pi].greenTime;
+      }
+      return;
+    }
+
+    --timer;
+    if (timer <= 0) {
+      discharge(schedule[pi].roadIdx);
+      yPhase = true;
+      yTimer = YELLOW_SEC;
+    }
+  }
+
+  bool isDone() { return done; }
+
+  // ── Write live state to state.json so dashboard.html can read it ─────────
+  void writeState() {
+    std::ofstream f("state.json");
+    if (!f.is_open())
+      return;
+    auto sigStr = [](Sig s) -> std::string {
+      if (s == Sig::G)
+        return "G";
+      if (s == Sig::Y)
+        return "Y";
+      return "R";
+    };
+    int totalV = 0;
+    for (auto &r : roads)
+      totalV += r.vehicles;
+    int eff = GreedyScheduler::efficiency(roads, schedule);
+
+    f << "{\n";
+    f << "  \"cycle\": " << cycle << ",\n";
+    f << "  \"cleared\": " << cleared << ",\n";
+    f << "  \"efficiency\": " << eff << ",\n";
+    f << "  \"timer\": " << timer << ",\n";
+    f << "  \"phaseIdx\": " << (pi % (int)schedule.size()) << ",\n";
+    f << "  \"yellow\": " << (yPhase ? "true" : "false") << ",\n";
+    f << "  \"done\": " << (done ? "true" : "false") << ",\n";
+    f << "  \"maxCycles\": \"Unlimited\",\n";
+
+    // Roads array
+    f << "  \"roads\": [\n";
+    for (int i = 0; i < (int)roads.size(); i++) {
+      f << "    {";
+      f << "\"name\":\"" << roads[i].name << "\",";
+      f << "\"vehicles\":" << roads[i].vehicles << ",";
+      f << "\"signal\":\"" << sigStr(roads[i].signal) << "\",";
+      f << "\"hasEmergency\":" << (roads[i].hasEmergency ? "true" : "false")
+        << ",";
+      f << "\"totalCleared\":" << roads[i].totalCleared;
+      f << "}" << (i < (int)roads.size() - 1 ? "," : "") << "\n";
+    }
+    f << "  ],\n";
+
+    // Schedule array
+    f << "  \"schedule\": [\n";
+    for (int i = 0; i < (int)schedule.size(); i++) {
+      const SchedEntry &s = schedule[i];
+      f << "    {";
+      f << "\"roadIdx\":" << s.roadIdx << ",";
+      f << "\"vehicles\":" << s.vehicles << ",";
+      f << "\"greenTime\":" << s.greenTime << ",";
+      f << "\"rank\":" << s.rank << ",";
+      f << "\"emergency\":" << (s.hasEmergency ? "true" : "false") << ",";
+      f << "\"active\":" << (i == pi % (int)schedule.size() ? "true" : "false");
+      f << "}" << (i < (int)schedule.size() - 1 ? "," : "") << "\n";
+    }
+    f << "  ]\n";
+    f << "}\n";
+    f.close();
+  }
+
+  void render() {
+    syncWithOpenCV(); // ← perfectly mirrors OpenCV counts for dashboard and console
+    std::cout << CLRSCR;
+    printHeader();
+    printView(roads, schedule, pi, timer, cycle, cleared);
+    writeState(); // ← sync state to dashboard
+  }
+
+  void printFinalReport() {
+    std::cout << "\n"
+              << BOLD + GRN
+              << "  ============================================\n"
+              << "   SIMULATION COMPLETE -- All Traffic Cleared\n"
+              << "  ============================================\n"
+              << RST;
+
+    std::cout << BOLD << "  Total vehicles cleared : " << GRN << cleared << RST
+              << "\n";
+    std::cout << BOLD << "  Green-time efficiency  : " << CYN
+              << GreedyScheduler::efficiency(roads, schedule) << "%" << RST
+              << "  (green secs on roads with vehicles)\n\n";
+
+    // ── Per-road summary ──────────────────────────────────────────────────
+    std::cout << BOLD << "  Per-road summary:\n" << RST;
+    std::cout << "  +----------+---------------+----------+-----------+\n";
+    std::cout << "  | Road     | Input vehicles| Cleared  | Remaining |\n";
+    std::cout << "  +----------+---------------+----------+-----------+\n";
+    for (int i = 0; i < (int)roads.size(); i++) {
+      std::cout << "  | " << std::left << std::setw(8) << roads[i].name << " | "
+                << std::right << std::setw(13) << roads[i].originalInput
+                << " | " << std::setw(8) << roads[i].totalCleared << " | "
+                << std::setw(9) << roads[i].vehicles << " |\n";
+    }
+    std::cout << "  +----------+---------------+----------+-----------+\n";
+
+    // ── Greedy vs Fixed-time comparison (using original vehicle counts) ───
+    const int fixedT = clamp(T_CYCLE / NUM_ROADS, MIN_GREEN, MAX_GREEN);
+
+    // Rebuild greedy schedule from original inputs for a fair comparison
+    std::vector<Road> tmpR = roads;
+    for (int i = 0; i < (int)tmpR.size(); i++)
+      tmpR[i].vehicles = tmpR[i].originalInput;
+    std::vector<SchedEntry> cmpSched = GreedyScheduler::build(tmpR);
+    std::vector<int> gGreen(NUM_ROADS, fixedT);
+    for (int i = 0; i < (int)cmpSched.size(); i++)
+      gGreen[cmpSched[i].roadIdx] = cmpSched[i].greenTime;
+
+    std::cout
+        << "\n"
+        << BOLD + MAG
+        << "  === GREEDY vs FIXED-TIME (per-cycle, initial load) ===\n"
+        << RST << "  Fixed-time  : every road gets " << fixedT
+        << "s  (= T_cycle / " << NUM_ROADS << ")\n"
+        << "  Throughput  : " << THROUGHPUT << " vehicles/sec of green\n\n"
+        << "  +----------+------+---------------+---------------+----------+\n"
+        << "  | Road     | Veh  | Fixed         | Greedy        |  Gain    |\n"
+        << "  +----------+------+---------------+---------------+----------+\n";
+
+    int totG = 0, totF = 0;
+    for (int i = 0; i < NUM_ROADS; i++) {
+      int v = roads[i].originalInput;
+      int gT = gGreen[i];
+      int gC = (v < gT * THROUGHPUT) ? v : gT * THROUGHPUT;
+      int fC = (v < fixedT * THROUGHPUT) ? v : fixedT * THROUGHPUT;
+      int gain = gC - fC;
+      std::string gainStr = (gain >= 0 ? "+" : "") + std::to_string(gain) + "v";
+      std::string gainCol = gain > 0 ? GRN : (gain < 0 ? YLW : RST);
+      std::cout << "  | " << std::left << std::setw(8) << roads[i].name << " | "
+                << std::right << std::setw(3) << v << "v "
+                << " | " << fixedT << "s -> " << std::setw(3) << fC
+                << "v cleared "
+                << " | " << gT << "s -> " << std::setw(3) << gC << "v cleared "
+                << " | " << gainCol << std::setw(5) << gainStr << RST
+                << "   |\n";
+      totG += gC;
+      totF += fC;
+    }
+    int impPct = totF > 0 ? (totG - totF) * 100 / totF : 0;
+    std::cout
+        << "  +----------+------+---------------+---------------+----------+\n"
+        << "  Greedy: " << GRN << BOLD << totG << "v/cycle" << RST
+        << "   Fixed: " << YLW << totF << "v/cycle" << RST << "   "
+        << BOLD + GRN << "Improvement: +" << impPct << "%\n"
+        << RST;
+  }
+
+  void run() {
+    while (!isDone()) {
+      tick();
+      if (!isDone()) {
+        render();
+        sleepMs(300);
+      }
+    }
+    printFinalReport();
+  }
+};
+
+int main(int argc, char *argv[]) {
+  enableColors();
+  TrafficSystem sys;
+  sys.run();
+  return 0;
+}
